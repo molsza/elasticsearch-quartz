@@ -1,0 +1,9 @@
+quartz:
+  enabled: true
+
+elastic:
+  user: elastic
+  password:
+  serverUrl:
+  port: 9200
+  serverPathPrefix:
