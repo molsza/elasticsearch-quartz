@@ -6,8 +6,6 @@ import lombok.Setter;
 
 /**
  * Represents a wrapped trigger.
- *
- * @author Anton Johansson
  */
 @Getter
 @Setter

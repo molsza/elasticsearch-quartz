@@ -9,8 +9,6 @@ import org.quartz.impl.JobDetailImpl;
 
 /**
  * Provides utilities for managing jobs.
- *
- * @author Anton Johansson
  */
 public final class JobUtils
 {

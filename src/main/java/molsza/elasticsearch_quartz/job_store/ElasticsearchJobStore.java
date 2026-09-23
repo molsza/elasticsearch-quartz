@@ -16,15 +16,35 @@ import co.elastic.clients.util.ObjectBuilder;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
 import org.quartz.Calendar;
-import org.quartz.*;
+import org.quartz.Calendar;
+import org.quartz.JobDetail;
+import org.quartz.JobKey;
+import org.quartz.JobPersistenceException;
+import org.quartz.ObjectAlreadyExistsException;
+import org.quartz.SchedulerConfigException;
+import org.quartz.SchedulerException;
+import org.quartz.Trigger;
 import org.quartz.Trigger.CompletedExecutionInstruction;
 import org.quartz.Trigger.TriggerState;
+import org.quartz.TriggerKey;
 import org.quartz.impl.matchers.GroupMatcher;
 import org.quartz.impl.matchers.StringMatcher;
-import org.quartz.spi.*;
+import org.quartz.spi.ClassLoadHelper;
+import org.quartz.spi.JobStore;
+import org.quartz.spi.OperableTrigger;
+import org.quartz.spi.SchedulerSignaler;
+import org.quartz.spi.TriggerFiredBundle;
+import org.quartz.spi.TriggerFiredResult;
 
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -345,8 +365,7 @@ public class ElasticsearchJobStore implements JobStore {
 
   @Override
   public boolean removeCalendar(String calName) throws JobPersistenceException {
-    calendarsByName.remove(calName);
-    return false;
+    return calendarsByName.remove(calName) != null;
   }
 
   @Override
@@ -433,13 +452,27 @@ public class ElasticsearchJobStore implements JobStore {
           Query.of(f2 -> f2.term(t -> t.field("jobName").value(jobKey.getName())))
       )))).index(indexName), TriggerWrapper.class).hits().hits().stream().map(s -> TriggerUtils.fromWrapper(s.source())).collect(Collectors.toList());
     } catch (IOException | ElasticsearchException e) {
-      throw new IllegalStateException(e);
+      throw new JobPersistenceException(e.getMessage(), e);
     }
   }
 
   @Override
   public TriggerState getTriggerState(TriggerKey triggerKey) throws JobPersistenceException {
-    return null;
+    try {
+      var response = client.get(g -> g.index(indexName).id(triggerKey.toString()), TriggerWrapper.class);
+      if (!response.found()) return TriggerState.NONE;
+      switch (response.source().getState()) {
+        case STATE_WAITING:
+        case STATE_ACQUIRED:
+        case STATE_EXECUTING: return TriggerState.NORMAL;
+        case STATE_COMPLETED: return TriggerState.COMPLETE;
+        case STATE_PAUSE: return TriggerState.PAUSED;
+        case STATE_ERROR: return TriggerState.ERROR;
+        default: return TriggerState.NONE;
+      }
+    } catch (Exception e) {
+      throw new JobPersistenceException(e.getMessage(), e);
+    }
   }
 
   @Override
@@ -506,7 +539,7 @@ public class ElasticsearchJobStore implements JobStore {
               m.field("type").query("trigger")).build(),
           new Query.Builder().match(m ->
               m.field("state").query(STATE_PAUSE)).build()))), TriggerWrapper.class);
-      return response.hits().hits().stream().map(s -> s.id()).collect(Collectors.toSet());
+      return response.hits().hits().stream().map(s -> s.source().getGroup()).collect(Collectors.toSet());
     } catch (Exception e) {
       throw new JobPersistenceException(e.getMessage(), e);
     }
@@ -551,7 +584,7 @@ public class ElasticsearchJobStore implements JobStore {
         var idSet = r.items().stream().filter(i -> i.error() == null).map(i -> i.id()).collect(Collectors.toList());
         if (!idSet.isEmpty()) {
           var res = client.mget(g -> g.index(indexName).ids(idSet), TriggerWrapper.class);
-          return res.docs().stream().filter(v -> v.result().source().getNextFireTime() > 0).map(h -> TriggerUtils.fromWrapper(h.result().source())).collect(Collectors.toList());
+          return res.docs().stream().filter(v -> v.isResult() && v.result().source() != null && v.result().source().getNextFireTime() > 0).map(h -> TriggerUtils.fromWrapper(h.result().source())).collect(Collectors.toList());
         }
       }
       return Collections.emptyList();
@@ -575,7 +608,7 @@ public class ElasticsearchJobStore implements JobStore {
                 m.field("type").query("trigger")).build(),
             new Query.Builder().match(m ->
                 m.field("state").query(STATE_ACQUIRED)).build(),
-            new Query.Builder().range(m -> m.field("executionTimeout").lte(JsonData.of(noLaterThan))).build(),
+            new Query.Builder().range(m -> m.field("executionTimeout").gt(JsonData.of(0)).lte(JsonData.of(noLaterThan))).build(),
             new Query.Builder().range(m -> m.field("nextFireTime").gt(JsonData.of(0)).lte(JsonData.of(noLaterThan + timeWindow))).build()
         ).build()._toQuery()
     )));
@@ -633,11 +666,10 @@ public class ElasticsearchJobStore implements JobStore {
     JobDetail job = retrieveJob(jobKey);
     OperableTrigger trigger = TriggerUtils.fromWrapper(triggerWrapper);
 
+    // trigger.triggered() was already called in triggersFired(); previousFireTime is the scheduled fire time
     Date scheduledFireTime = trigger.getPreviousFireTime();
-    trigger.triggered(null);
-    Date previousFireTime = trigger.getPreviousFireTime();
 
-    return new TriggerFiredBundle(job, trigger, null, false, new Date(), scheduledFireTime, previousFireTime, trigger.getNextFireTime());
+    return new TriggerFiredBundle(job, trigger, null, false, new Date(), scheduledFireTime, null, trigger.getNextFireTime());
   }
 
   @Override
@@ -690,7 +722,7 @@ public class ElasticsearchJobStore implements JobStore {
     }
   }
 
-  private boolean updateTrigger(TriggerKey key, int to, Integer from) {
+  private boolean updateTrigger(TriggerKey key, int to, Integer from) throws JobPersistenceException {
     try {
       var response = client.get(g -> g.index(indexName).id(key.toString()), TriggerWrapper.class);
       if (response.found() && (from == null || response.source().getState() == from) && response.source().getState() != to) {
@@ -707,7 +739,7 @@ public class ElasticsearchJobStore implements JobStore {
         }
       } else return false;
     } catch (Exception e) {
-      return false;
+      throw new JobPersistenceException("Failed to update trigger " + key + " state to " + to, e);
     }
   }
 

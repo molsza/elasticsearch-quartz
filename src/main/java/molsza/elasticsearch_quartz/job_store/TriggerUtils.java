@@ -14,8 +14,6 @@ import java.util.Date;
 
 /**
  * Provides utilities for managing triggers.
- *
- * @author Anton Johansson
  */
 public final class TriggerUtils {
   private static final Logger LOGGER = LoggerFactory.getLogger(TriggerUtils.class);
@@ -118,7 +116,7 @@ public final class TriggerUtils {
     triggerWrapper.setEndTime(getTime(trigger.getEndTime()));
     triggerWrapper.setNextFireTime(getTime(trigger.getNextFireTime()));
     triggerWrapper.setPreviousFireTime(getTime(trigger.getPreviousFireTime()));
-    triggerWrapper.setMaxExecutionTime((Integer) trigger.getJobDataMap().getOrDefault("timeout", 60 * 60 * 1000));
+    triggerWrapper.setMaxExecutionTime(((Number) trigger.getJobDataMap().getOrDefault("timeout", 60 * 60 * 1000)).intValue());
 
     if (trigger instanceof SimpleTriggerImpl) {
       addSimpleTriggerImplProperties(triggerWrapper, (SimpleTriggerImpl) trigger);
